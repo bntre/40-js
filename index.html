@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html>
+<style>
+html, body { width: 100%; height: 100%; margin: 0; border: 0; overflow: hidden; }
+</style>
+<script src="vectors.js"></script>
+<script type="text/javascript">
+
+/*
+Controls:
+    mouse move      - rotation
+    mouse L-drag    - rotation
+    mouse wheel     - flying
+    mouse R-drag
+        horizontal  - circle size
+        vertical    - transparency
+
+Source location: https://github.com/bntre/40-js
+Initially published (2021): https://bntr.livejournal.com/68162.html
+*/
+
+let   _canvas, _ctx;
+let   _matWorld = MatNew(); // collecting rotations
+const _dimensions = 4; // 3 or 4
+const _stereo = true;
+const _stereoAngle = 0.025 * Math.PI;
+let   _groups = []; // group is an object for drawing a single circle
+const _projHeight = 1.2; // 1.0 for stereographic projection
+let   _circleRadius = 0.3; // changed by horizontal mouse drag
+let   _alphaCurve = 0.2; // -1..1 changed by vertical mouse drag
+let   _mouseX1 = 0, _mouseY1 = 0; // last mouse coordinates normalized: ~(-1..1) used for free rotations
+let   _dragMouseX0 = 0, _dragMouseY0 = 0, _dragMouseX = 0, _dragMouseY = 0; // dragging rotation
+let   _flyingSpeed = 0.0; // PI/sec; current speed for 4d - changed by mouse wheel
+const _debug = false;
+
+//--------------------------------------------------
+// canvas coordinate transformations
+
+const _tileCountX = _stereo ? 2 : 1; // we divide the canvas to 2 tiles for stereo
+let _tileRadius = -1; // radius of single tile in pixels
+let _currentTileCenter = []; // vector in pixels
+
+let _worldRadius = 2.3; // fitted into a tile
+
+function updateTileRadius() { // set _tileRadius from canvas size
+    _tileRadius = Math.min(
+        _canvas.width / _tileCountX, 
+        _canvas.height
+    ) / 2;
+}
+
+function setCurrentTile(j) {
+    _currentTileCenter = [
+        _canvas.width / 2 + (j*2 - (_tileCountX-1)) * _tileRadius,
+        _canvas.height / 2
+    ];
+}
+
+function worldToCanvasScalar(r) {
+    return r / _worldRadius * _tileRadius;
+}
+function worldToCanvas(x, y) {
+    return [
+        worldToCanvasScalar(x) + _currentTileCenter[0],
+        worldToCanvasScalar(y) + _currentTileCenter[1]
+    ];
+}
+
+//--------------------------------------------------
+
+function increaseByLog(x, xOrigin = 2.0) {
+    // try to increade/decrease a value human-friendly
+    let i = Math.pow(2, x + xOrigin);
+    i = Math.floor(i + 0.000001) + 1;
+    return Math.log2(i) - xOrigin;
+}
+
+function initCanvas() {
+    if (_canvas) return;
+    _canvas = document.getElementById('canvas');
+    
+    window.onresize = resizeCanvasToWindow;
+    resizeCanvasToWindow(); // call at once
+
+    // handle mouse events
+    _canvas.addEventListener('mousedown', function (e) {
+        if (e.buttons == 1) {
+            // for dragging rotation
+            _dragMouseX0 = e.clientX;
+            _dragMouseY0 = e.clientY;
+        }
+    });
+    
+    _canvas.addEventListener('mousemove', function (e) {
+        _mouseX1 = (e.clientX * 2 - _canvas.width ) / _canvas.height; // -k..k (by height)
+        _mouseY1 = (e.clientY * 2 - _canvas.height) / _canvas.height; // -1..1
+        if (e.buttons == 1) { // L-button
+            // dragging rotation
+            _dragMouseX += e.clientX - _dragMouseX0;
+            _dragMouseY += e.clientY - _dragMouseY0;
+            _dragMouseX0 = e.clientX;
+            _dragMouseY0 = e.clientY;
+        } else if (e.buttons == 2) { // R-button
+            _circleRadius = e.clientX / _canvas.width * 0.6; // 0..0.6
+            _alphaCurve = (e.offsetY * 2 - _canvas.height) / _canvas.height; // -1..1
+            initWorld(); // we have to reinit the world (depending on _circleRadius)
+        }
+    }, {capture: true});
+    
+    _canvas.addEventListener('wheel', function (e) {
+        if (e.deltaY > 0) _flyingSpeed =  increaseByLog( _flyingSpeed);
+        else              _flyingSpeed = -increaseByLog(-_flyingSpeed);
+    }, {passive: true});
+    
+    _canvas.addEventListener("contextmenu", e => e.preventDefault()); // we use R-button
+}
+
+function resizeCanvasToWindow() {
+    resizeCanvas(
+        window.innerWidth,
+        window.innerHeight
+    );
+}
+
+function resizeCanvas(w, h) {
+    _canvas.width  = w;
+    _canvas.height = h;
+
+    // update tile size
+    updateTileRadius();
+    if (!_stereo) setCurrentTile(0); // set once for mono
+    
+    // reinit context
+    _ctx = _canvas.getContext("2d");
+};
+
+//========================================================================
+// Extend vectors.js
+
+function vecNormalize(v) {
+    let len = VecLen(v);
+    if (len == 0) return false; // zero vector - not normalized
+    if (len != 1.0)
+        vecMult(v, 1.0 / len);
+    return true; // normalized
+}
+
+function* iterRotationsToVector(vec) {
+    let cur = VecCopy(vec) // we will transform it into (0,0,1)
+    for (let i=0; i+1<cur.length; ++i) {
+        j = i+1;
+        
+        // make normalized vector vi in (j,i) plane
+        let vi = [cur[j], cur[i]];
+        let isNorm = vecNormalize(vi);
+        if (!isNorm) continue; // zero - no need to rotate 'cur' j->i
+        
+        // our spherical rotation angles {z->y, y->x}
+        //                                j->i, j->i
+        const [c, s] = vi;
+        const mv = MatRotation2(i,j, c,s);
+        const mr = MatRotation2(j,i, c,s);
+        
+        cur = MatMultVec(mv, cur); // rotate cur j->i. i coordinate becomes 0
+        
+        yield mr;
+    }
+    // cur is (0,0,1) now
+}
+
+function getRotationsToVector(vec) {
+    // matrix rotating (0,0,1) to vec
+    let m = MatNew();
+    for (const r of iterRotationsToVector(vec))
+        m = MatMult(m, r);
+    return m;
+}
+
+function getRotationsFromVector(vec) {
+    // matrix rotating vec to (0,0,1)
+    let m = MatNew();
+    for (const r of iterRotationsToVector(vec))
+        m = MatMult(r, m);
+    return m;
+}
+
+function VecProject(v, h) {
+    let r = VecCopy(v);
+    const w = r.pop();
+    const p = h / (h - w);
+    vecMult(r, p);
+    return r;
+}
+
+//========================================================================
+// Our world
+
+// Each circle|sphere is got by approximation of group of points 
+//   projected from initial space (3|4d) after rotation.
+// To get groups:
+//   1. prepare 4|6 points like "[0,0,0,1] + radius * dir"
+//                                (pivot)
+//   2. then rotate them to each node.
+
+const _worldRawValues = _dimensions == 3 ? {
+    // 3d
+    nodes: [
+        [1, 1, 1], [1,-1, 1], [-1, 1, 1], [-1,-1, 1], // cube vertices (8)
+        [1, 1,-1], [1,-1,-1], [-1, 1,-1], [-1,-1,-1],
+        [ 1, 0, 0], [0, 1, 0], [0, 0, 1], // cube faces
+        [-1, 0, 0], [0,-1, 0], [0, 0,-1],
+    ],
+    pivot: [0, 0, 1],
+    dirs: [
+        [ 1, 0, 0], [0, 1, 0],
+        [-1, 0, 0], [0,-1, 0],
+    ]
+} : {
+    // 4d
+    nodes: [
+        [ 1, 0, 0, 0], [ 0, 1, 0, 0], [ 0, 0, 1, 0], [ 0, 0, 0, 1], // 4d cube cells (8)
+        [-1, 0, 0, 0], [ 0,-1, 0, 0], [ 0, 0,-1, 0], [ 0, 0, 0,-1],
+        [ 0, 1, 1, 1], [ 1, 0, 1, 1], [ 1, 1, 0, 1], [ 1, 1, 1, 0], // 4d cube edges
+        [ 0, 1, 1,-1], [ 1, 0, 1,-1], [ 1, 1, 0,-1], [ 1, 1,-1, 0],
+        [ 0, 1,-1, 1], [ 1, 0,-1, 1], [ 1,-1, 0, 1], [ 1,-1, 1, 0],
+        [ 0, 1,-1,-1], [ 1, 0,-1,-1], [ 1,-1, 0,-1], [ 1,-1,-1, 0],
+        [ 0,-1, 1, 1], [-1, 0, 1, 1], [-1, 1, 0, 1], [-1, 1, 1, 0],
+        [ 0,-1, 1,-1], [-1, 0, 1,-1], [-1, 1, 0,-1], [-1, 1,-1, 0],
+        [ 0,-1,-1, 1], [-1, 0,-1, 1], [-1,-1, 0, 1], [-1,-1, 1, 0],
+        [ 0,-1,-1,-1], [-1, 0,-1,-1], [-1,-1, 0,-1], [-1,-1,-1, 0],
+    ],
+    pivot: [0, 0, 0, 1],
+    dirs: [
+        [ 1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0],
+        [-1, 0, 0, 0], [0,-1, 0, 0], [0, 0,-1, 0],
+    ]
+}
+
+function initWorld() {
+    // make nodes and dirs from raw values
+    let nodes = [];
+    let dirs  = [];
+    for (let n of _worldRawValues.nodes) {
+        let v = VecCopy(n);
+        vecNormalize(v);
+        nodes.push(v);
+    }
+    for (let d of _worldRawValues.dirs) {
+        let v = VecCopy(d);
+        vecMult(v, _circleRadius);
+        vecAdd(v, _worldRawValues.pivot);
+        vecNormalize(v);
+        dirs.push(v);
+    }
+
+    // fill groups
+    _groups = [];
+    let i = 0;
+    for (let c of nodes) {
+        let g = {
+            index: i++,
+            center: c,
+            points: [],
+        };
+        let rot = getRotationsToVector(c);
+        for (let d of dirs) {
+            let p = MatMultVec(rot, d);
+            g.points.push(p);
+        }
+        _groups.push(g);
+    }
+}
+
+function initMatrices() {
+    // just random initial posing
+    if (_dimensions == 4) {
+        const dirs = [
+            [1, 0, 0, 0], // sym 4
+            [1, 1, 0, 0], // sym 2
+            [1, 1, 1, 0], // sym 3
+        ]
+        let dir = dirs[new Date().getTime() % dirs.length];
+        vecNormalize(dir);
+        _matWorld = getRotationsFromVector(dir);
+    } else {
+        const dirs = [
+            [1, 0, 0], // sym 4
+            [1, 1, 0], // sym 2
+            [1, 1, 1], // sym 3
+        ]
+        let dir = dirs[new Date().getTime() % dirs.length];
+        vecNormalize(dir);
+        _matWorld = getRotationsFromVector(dir);
+    }
+}
+
+function updateMatrices(deltaSecs) {
+    // Dragging rotation
+    if (_dragMouseX !== 0 || _dragMouseY !== 0) {
+        const c = 0.1 * Math.PI * deltaSecs;
+        const matStepX = MatRotation(0, 2, _dragMouseX * c);
+        const matStepY = MatRotation(1, 2, _dragMouseY * c);
+        _matWorld = MatMult(matStepX, _matWorld);
+        _matWorld = MatMult(matStepY, _matWorld);
+        _dragMouseX = 0;
+        _dragMouseY = 0;
+    }
+    
+    /*
+    */
+    // World
+    const mouseR1 = VecLen([_mouseX1, _mouseY1]); // 0..~1
+    const rotationShift = lerp(0.2, 0.5, mouseR1) * Math.PI; // we allow to rotate without W (shift is pi/2) if mouse is on periphery
+    if (_dimensions == 4) {
+        // w-shift before rotation
+        const matStepW = MatRotation(3, 2, rotationShift);
+        _matWorld = MatMult(matStepW, _matWorld);
+    }
+    
+    // Free rotation
+    if (_mouseX1 !== 0 || _mouseY1 !== 0) {
+        const rotStep = 0.5 * Math.PI * deltaSecs;
+        const matStepX = MatRotation(_dimensions-1, 0, _mouseX1 * rotStep);
+        const matStepY = MatRotation(_dimensions-1, 1, _mouseY1 * rotStep);
+        _matWorld = MatMult(matStepX, _matWorld);
+        _matWorld = MatMult(matStepY, _matWorld);
+    }
+    
+    if (_dimensions == 4) {
+        // w-shift back + flying
+        const flyingStep = _flyingSpeed * deltaSecs;
+        const matStepW = MatRotation(3, 2, flyingStep - rotationShift);
+        _matWorld = MatMult(matStepW, _matWorld);
+    }
+}
+
+function getCircle(points) { // kind of an approximation by circle|sphere
+    let n = points[0].length; // vector size
+    //
+    let pos = VecNew(n);
+    for (let p of points) vecAdd(pos, p);
+    vecMult(pos, 1.0 / points.length);
+    //
+    let rs = [];
+    for (let p of points) {
+        let d = VecCopy(p);
+        vecSub(d, pos);
+        const r = VecLen(d);
+        rs.push(r);
+    }
+    let radius = rs.reduce((a, b) => a + b, 0);
+    radius /= rs.length;
+    //
+    return [pos, radius];
+}
+
+//--------------------------------------------------
+// some interpolation math
+function lerp(a, b, t) {
+    //  0..t..1
+    //  a     b
+    return (1-t)*a + t*b;
+}
+function lerp3(x0, a, x1, b, x) {
+    //  x0..x..x1
+    //  a      b
+    const t = (x - x0) / (x1 - x0);
+    return lerp(a, b, t);
+}
+function curve(c, t) {
+    // c = -C..C, t = 0..1
+    const e = Math.exp(c);
+    return Math.pow(t, e*e);
+}
+
+
+function drawScene(matScene) {
+    // prepare groups for frame
+    for (let g of _groups) {
+        // alpha
+        const centerRot = MatMultVec(matScene, g.center);
+        const centerRotW = VecAt(centerRot, -1);
+        let alpha = (centerRotW + 1) / 2; // 0..1
+        alpha = curve(_alphaCurve * 2.0, alpha); // 0..1
+        g.alpha = lerp3(0,1, 1,0.05, alpha); // 1..0.05
+        // project and get circle
+        pointsProj = [];
+        for (let p of g.points) {
+            p = MatMultVec(matScene, p);
+            p = VecProject(p, _projHeight);
+            pointsProj.push(p);
+        }
+        if (_debug) {
+            g.pointsProj = pointsProj; // save for debug view
+        }
+        g.circle = getCircle(pointsProj);
+        // get depth for z-order
+        const circlePos = g.circle[0];
+        const circlePosW = VecAt(circlePos, -1); // in projected space: -inf..inf
+        g.depth = (Math.atan(circlePosW) + 1) / 2; // 0..1
+    }
+    
+    // z-order groups
+    _groups.sort(function(g0, g1) {
+        return g1.depth - g0.depth;
+    });
+    
+    for (let g of _groups) {
+        // circle
+        {
+            const [pos, r] = g.circle;
+            const [X, Y] = worldToCanvas(pos[0], pos[1]);
+            const R = worldToCanvasScalar(r);
+            _ctx.beginPath();
+            _ctx.arc(X,Y, R, 0,2*Math.PI);
+            const ci = g.index < 8 ? 0 : 255; // other color for first 8 nodes
+            const cd = Math.floor(lerp(0xFF, 0, g.depth));
+            _ctx.fillStyle = `rgba(${ci}, ${cd}, 127, ${g.alpha})`;
+            _ctx.fill();
+        }
+        if (_debug) {
+            // draw projected points
+            _ctx.fillStyle = '#FF00FFFF';
+            for (let p of g.pointsProj) {
+                const [X, Y] = worldToCanvas(p[0], p[1]);
+                _ctx.beginPath();
+                _ctx.arc(X,Y, 2, 0,2*Math.PI);
+                _ctx.fill();
+            }
+        }
+    }
+}
+
+function drawFrame() {
+    const fillWhite = false;
+    if (fillWhite) {
+        _ctx.fillStyle = "white";
+        _ctx.fillRect(0, 0, _canvas.width, _canvas.height);
+    } else {
+        _ctx.clearRect(0, 0, _canvas.width, _canvas.height);
+    }
+    
+    if (!_stereo) {
+        drawScene(_matWorld);
+    } else {
+        let angles = [_stereoAngle, -_stereoAngle];
+        for (const i of [0,1]) {
+            setCurrentTile(i);
+            let mat = MatRotation(2,0, angles[i]);
+            mat = MatMult(mat, _matWorld);
+            drawScene(mat);
+        }
+    }
+}
+
+//------------------------------------------------------------------
+// Render an animation frames
+const _frameCount = 40;
+let   _frameIndex = 0;
+function downloadFrames() {
+    const test = true; // true to skip downloading
+    
+    // Set camera
+    const t = _frameIndex / _frameCount; // [0..1)
+    const matRot  = MatRotation(0,2, t * 0.5  * Math.PI);
+    const matTilt = MatRotation(1,2,     0.04 * Math.PI);
+    const matW    = MatRotation(3,2,    -0.15 * Math.PI);
+    _matWorld = [matTilt, matW, matRot].reduce(MatMult);
+    
+    // Set circles
+    const a = t * 2 * Math.PI; // [0..2PI)
+    _circleRadius = lerp3(-1, 0.1, 1,0.4,  Math.cos(a));
+    _alphaCurve   = lerp3(-1,-0.2, 1,0.5, -Math.sin(a + 0.2 * Math.PI));
+    initWorld(); // our world depends on _circleRadius
+    
+    //
+    drawFrame();
+    //
+    if (!test) { // download
+        let el = document.getElementById('download');
+        el.setAttribute('download', '40_frame'+_frameIndex+'.png');
+        el.setAttribute('href', canvas.toDataURL("image/png").replace("image/png", "image/octet-stream"));
+        el.click();
+    }
+    //
+    _frameIndex += 1;
+    if (test) _frameIndex %= _frameCount; // loop if test
+    if (_frameIndex < _frameCount) {
+        // we don't spam
+        window.setTimeout(downloadFrames, test ? 40 : 200);
+    }
+}
+
+function main() {
+    initCanvas();
+    initWorld();
+    initMatrices();
+    
+    //! to render and download a custom animation frames
+    //downloadFrames(); return;
+    
+    // run animation
+    let prevTime = null;
+    
+    function animate(t) {
+        if (prevTime !== null) {
+            const dt = (t - prevTime) / 1000; // in seconds
+            if (dt < 1.0) { // don't animate lags
+                updateMatrices(dt);
+            }
+        }
+        prevTime = t;
+    
+        drawFrame();
+        
+        requestAnimationFrame(animate);
+    }
+
+    requestAnimationFrame(animate);
+}
+
+</script>
+<body onload="main()">
+    <canvas id="canvas"></canvas>
+    <a id="download"></a>
+</body>
+</html>
